@@ -4,3 +4,4 @@
 .gitignore
 /__pycache__
 .vscode
+/Qwen3-VL-2B-Instruct

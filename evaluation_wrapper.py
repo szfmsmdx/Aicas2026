@@ -9,9 +9,6 @@ Note:
 - The generate() method is optional and mainly for debugging.
 """
 from typing import Dict
-import os
-import time
-import contextlib
 try:
     from PIL import Image
 except ImportError:
@@ -60,13 +57,6 @@ class VLMModel:
             device_map=device
         )
         self._model.eval()
-
-        # Optional: profiling wrapper (enabled via env var)
-        self._profile_state = {"enabled": False, "count": 0, "limit": 0}
-        if os.getenv("PROFILE", "0") == "1":
-            self._enable_generate_profiler()
-        if os.getenv("NVTX", "0") == "1":
-            self._enable_nvtx_ranges()
         
         # Track applied optimizations
         self._optimizations_applied = []
@@ -316,164 +306,6 @@ class VLMModel:
         
         if 'quantization' not in self._optimizations_applied:
             self._optimizations_applied.append('quantization')
-
-    def _enable_generate_profiler(self):
-        """
-        Wrap model.generate with torch.profiler + NVTX ranges.
-
-        Controlled by env vars:
-        - PROFILE=1 (enable wrapper)
-        - PROFILE_DIR=profile (output directory)
-        - PROFILE_TAG=mm-dd-hh-mm (default timestamp)
-        - PROFILE_STEPS=1 (number of generate calls to profile)
-        - PROFILE_SKIP=0 (skip first N generate calls, e.g. warmup)
-        - NVTX=1 (enable NVTX ranges)
-        """
-        profile_dir = os.getenv("PROFILE_DIR", "profile")
-        os.makedirs(profile_dir, exist_ok=True)
-        profile_tag = os.getenv("PROFILE_TAG", time.strftime("%m-%d-%H-%M"))
-        limit = int(os.getenv("PROFILE_STEPS", "1"))
-        nvtx_enabled = os.getenv("NVTX", "1") == "1"
-
-        original_generate = self._model.generate
-        skip = int(os.getenv("PROFILE_SKIP", "0"))
-        self._profile_state = {"enabled": True, "count": 0, "limit": limit, "total": 0, "skip": skip}
-
-        def _nvtx_range(name: str):
-            if not nvtx_enabled or not torch.cuda.is_available():
-                return contextlib.nullcontext()
-            return torch.cuda.nvtx.range(name)
-
-        def wrapped_generate(*args, **kwargs):
-            self._profile_state["total"] += 1
-            if self._profile_state["total"] <= self._profile_state["skip"]:
-                return original_generate(*args, **kwargs)
-
-            if self._profile_state["count"] >= self._profile_state["limit"]:
-                return original_generate(*args, **kwargs)
-
-            self._profile_state["count"] += 1
-            max_new_tokens = kwargs.get("max_new_tokens", None)
-            step_tag = f"{profile_tag}_tok{max_new_tokens}" if max_new_tokens is not None else profile_tag
-            trace_path = os.path.join(profile_dir, f"trace_{step_tag}_{self._profile_state['count']}.json")
-            table_path = os.path.join(profile_dir, f"table_{step_tag}_{self._profile_state['count']}.txt")
-
-            with _nvtx_range("benchmark_generate"):
-                with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    record_shapes=True,
-                    profile_memory=True,
-                    with_stack=False
-                ) as prof:
-                    out = original_generate(*args, **kwargs)
-
-            try:
-                prof.export_chrome_trace(trace_path)
-                with open(table_path, "w", encoding="utf-8") as f:
-                    f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=50))
-            except Exception as e:
-                print(f"[VLMModel] Profiler export failed: {e}")
-
-            return out
-
-        self._model.generate = wrapped_generate
-        print(f"[VLMModel] Profiling enabled: dir={profile_dir}, tag={profile_tag}, steps={limit}, skip={skip}")
-
-    def _enable_nvtx_ranges(self):
-        """
-        Add NVTX ranges to key stages for Nsight Systems/Compute.
-
-        Controlled by env vars:
-        - NVTX=1 (enable ranges)
-        - NVTX_VERBOSE=1 (print which modules were wrapped)
-
-        Ranges:
-        - vision_encoder
-        - cross_modal
-        - prefill / decode (based on past_key_values)
-        - preprocess (processor.apply_chat_template)
-        """
-        if not torch.cuda.is_available():
-            print("[VLMModel] NVTX requested but CUDA is not available.")
-            return
-
-        verbose = os.getenv("NVTX_VERBOSE", "0") == "1"
-
-        def _nvtx_range(name: str):
-            return torch.cuda.nvtx.range(name)
-
-        def _wrap_method(obj, method_name: str, range_name: str):
-            original = getattr(obj, method_name, None)
-            if original is None or not callable(original):
-                return False
-            if getattr(original, "_nvtx_wrapped", False):
-                return False
-
-            def wrapped(*args, **kwargs):
-                with _nvtx_range(range_name):
-                    return original(*args, **kwargs)
-
-            wrapped._nvtx_wrapped = True
-            setattr(obj, method_name, wrapped)
-            return True
-
-        def _wrap_lm_forward(obj, method_name: str):
-            original = getattr(obj, method_name, None)
-            if original is None or not callable(original):
-                return False
-            if getattr(original, "_nvtx_wrapped", False):
-                return False
-
-            def wrapped(*args, **kwargs):
-                past = kwargs.get("past_key_values", None)
-                range_name = "decode" if past else "prefill"
-                with _nvtx_range(range_name):
-                    return original(*args, **kwargs)
-
-            wrapped._nvtx_wrapped = True
-            setattr(obj, method_name, wrapped)
-            return True
-
-        wrapped = []
-
-        # Processor preprocessing stage
-        if _wrap_method(self._processor, "apply_chat_template", "preprocess"):
-            wrapped.append("processor.apply_chat_template -> preprocess")
-
-        # Vision encoder stage (common attribute names)
-        for attr in ["vision_model", "vision_tower", "visual", "vision_encoder"]:
-            vision_obj = getattr(self._model, attr, None)
-            if vision_obj is not None:
-                if _wrap_method(vision_obj, "forward", "vision_encoder"):
-                    wrapped.append(f"model.{attr}.forward -> vision_encoder")
-                    break
-
-        # Cross-modal connector stage (best-effort)
-        for attr in ["connector", "projector", "proj", "cross_attn", "cross_attention", "mm_projector"]:
-            cm_obj = getattr(self._model, attr, None)
-            if cm_obj is not None:
-                if _wrap_method(cm_obj, "forward", "cross_modal"):
-                    wrapped.append(f"model.{attr}.forward -> cross_modal")
-                    break
-
-        # Prefill / decode ranges
-        for attr in ["model", "language_model"]:
-            lm_obj = getattr(self._model, attr, None)
-            if lm_obj is not None and _wrap_lm_forward(lm_obj, "forward"):
-                wrapped.append(f"model.{attr}.forward -> prefill/decode")
-                break
-        if _wrap_lm_forward(self._model, "forward"):
-            wrapped.append("model.forward -> prefill/decode")
-
-        if verbose and wrapped:
-            print("[VLMModel] NVTX wrapped modules:")
-            for item in wrapped:
-                print(f"  - {item}")
-        elif verbose:
-            print("[VLMModel] NVTX enabled but no target modules were wrapped.")
     
     # Required properties for benchmark
     @property
